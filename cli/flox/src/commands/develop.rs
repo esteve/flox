@@ -1,9 +1,10 @@
+use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use bpaf::Bpaf;
+use bpaf::{Bpaf, Parser};
 use flox_config::Config;
 use flox_events::LifecycleFields;
 use flox_manifest::lockfile::Lockfile;
@@ -19,7 +20,7 @@ use flox_rust_sdk::providers::build::{
 };
 use flox_rust_sdk::providers::catalog_lock::BuildCatalogLock;
 use flox_rust_sdk::providers::nix;
-use indoc::formatdoc;
+use indoc::{formatdoc, indoc};
 use nef_lock_catalog::NixFlakeref;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -43,24 +44,23 @@ use crate::utils::message;
 /// actually runs a package's build in. Printed in full on entry — see
 /// [`Develop::print_disclosure`] — because the ones most likely to burn a
 /// user are exactly the ones nobody opens a manpage to discover.
-const DISCLOSURE: &str = "\
-This shell approximates the build environment for '{name}'.
-It is not the build. Known differences:
-  - No build sandbox is applied here. 'flox build' runs the build under
-    'nix build', which the Nix daemon may sandbox.
-  - Your working tree is visible here, including files git does not
-    track. A real build sees only tracked files.
-  - '$src' is a snapshot in the Nix store, taken when you entered.
-    'genericBuild' builds that snapshot, not your working tree; edits
-    reach it only when you re-enter. See 'man flox-develop'.
-  - '$out' and the other output variables point at placeholder paths
-    under /tmp/outputs, not at store paths. Nothing installed there is
-    a real build output.
-  - The host PATH stays reachable after the build inputs, and if your
-    '~/.bashrc' activates a Flox environment, that environment is on
-    PATH here too. A real build sees only its own inputs.
-  - This shell is interactive and sources '~/.bashrc'. The build shell
-    does neither.";
+const DISCLOSURE: &str = indoc! {"
+    This shell approximates the build environment for '{name}'.
+    It is not the build. Known differences:
+      - No build sandbox is applied here. 'flox build' runs the build under
+        'nix build', which the Nix daemon may sandbox.
+      - Your working tree is visible here, including files git does not
+        track. A real build sees only tracked files.
+      - '$src' is a snapshot in the Nix store, taken when you entered.
+        'genericBuild' builds that snapshot, not your working tree; edits
+        reach it only when you re-enter. See 'man flox-develop'.
+      - '$out' and the other output variables point at placeholder paths,
+        not at store paths. Nothing installed there is a real build output.
+      - The host PATH stays reachable after the build inputs, and if your
+        '~/.bashrc' activates a Flox environment, that environment is on
+        PATH here too. A real build sees only its own inputs.
+      - This shell is interactive and sources '~/.bashrc'. The build shell
+        does neither."};
 
 #[derive(Bpaf, Clone)]
 pub enum Develop {
@@ -78,10 +78,35 @@ pub struct DevelopOptions {
     #[bpaf(external(base_catalog_url_select), optional)]
     base_catalog_url_select: Option<BaseCatalogUrlSelect>,
 
-    /// The Nix expression package to develop.
-    /// Corresponds to an expression file in '.flox/pkgs/'.
-    #[bpaf(positional("package"), non_strict)]
-    package: String,
+    #[bpaf(external(package_argument))]
+    pub package: String,
+}
+
+/// A plain `positional(..., non_strict)` fails with bpaf's own catchable
+/// `Missing` error when absent, and that always loses to the deprecated
+/// `activate` branch's error when both branches fail on the same input:
+/// bpaf's alternation (`structs.rs::this_or_that_picks_first`) prefers
+/// whichever side failed with an uncatchable error, regardless of which
+/// side that is. `--stability`/`--nixpkgs-url` are flags this branch alone
+/// understands, so a failure to also find `<package>` should report as
+/// this branch's own message, not the deprecated branch's unrelated
+/// `-- <cmd>` suggestion (`flox develop --stability stable` reproduces
+/// this without the fix below). Routing the missing case through
+/// `.parse()` instead produces an uncatchable error unconditionally, which
+/// wins that comparison. A bare `flox develop` is unaffected: it still
+/// reaches the deprecated branch, because that branch parses the empty
+/// remainder successfully, and alternation always prefers a success over
+/// an error on the other side regardless of error kind.
+fn package_argument() -> impl Parser<String> {
+    bpaf::positional("package")
+        .help("The Nix expression package to develop.\nCorresponds to an expression file in '.flox/pkgs/'.")
+        .non_strict()
+        .optional()
+        .parse(|package: Option<String>| {
+            package.ok_or_else(|| {
+                "expected <PACKAGE>: the name of a Nix expression under '.flox/pkgs/'".to_string()
+            })
+        })
 }
 
 impl Develop {
@@ -123,33 +148,39 @@ impl Develop {
         } = opts;
 
         let mut env = environment.detect_concrete_environment(&mut flox, "Develop packages of")?;
-        match &env {
-            ConcreteEnvironment::Path(_) => (),
-            ConcreteEnvironment::Managed(managed) => {
-                bail!(needs_project_files_error(managed, "develop"))
-            },
-            ConcreteEnvironment::Remote(_) => {
-                // guarded by DirEnvironmentSelect
-                unreachable!("Cannot develop from a remote environment")
-            },
-        };
+        Self::refuse_managed_environment(&env)?;
 
         let base_dir = env.parent_path()?;
         let cache_path = env.cache_path()?;
-        let built_environments = env.build(&flox)?;
         let lockfile: Lockfile = env.lockfile(&flox)?.into();
         let lockfile_manifest = lockfile.migrated_manifest()?;
 
         let expression_parent_dir = env.dot_flox_path();
         let expression_path_ref = NixFlakeref::from_path(&expression_parent_dir)?;
-        let mut targets = packages_to_build(&lockfile_manifest, &expression_path_ref, &[package])?;
-        let target = targets.remove(0);
+        let targets = packages_to_build(&lockfile_manifest, &expression_path_ref, &[package])?;
+        let target = targets
+            .into_iter()
+            .next()
+            .context("packages_to_build returned no targets for the requested package")?;
 
+        // An unsandboxed manifest build already refuses `--stability`
+        // (`disallow_base_url_select_for_manifest_builds`, build.rs), but
+        // this check never runs here: `refuse_manifest_build` below rejects
+        // every manifest-build target unconditionally, before `--stability`
+        // is even inspected. If that blanket refusal is ever loosened,
+        // revisit whether the two checks need to be shared rather than
+        // duplicated (`build.rs`'s NEF preamble and this one have already
+        // drifted once).
         Self::refuse_manifest_build(&target)?;
 
         let expression_git_ref =
             check_git_tracking_for_expression_builds([&target], &expression_parent_dir)?;
         let expression_ref = expression_git_ref.unwrap_or(expression_path_ref);
+
+        // Both refusal paths above are cheap; `env.build()` below realises
+        // the environment's own build inputs and is the slow step, so nothing
+        // between the refusals and here should need it.
+        let built_environments = env.build(&flox)?;
 
         // The catalog lock the NEF eval consumes, created by the CLI
         // exactly as `flox build` does: the committed .flox/catalog.lock as
@@ -194,12 +225,12 @@ impl Develop {
         )?;
         let drv_path = eval_results
             .first()
-            .expect("eval() returns exactly one result for one requested package")
+            .context("eval() returned no results for the requested package")?
             .drv_path
             .clone();
 
         let env_script_path = Self::print_dev_env(&flox, &drv_path, target.name().as_ref())?;
-        let rcfile_path = Self::render_rcfile(&flox, &env_script_path, target.name().as_ref())?;
+        let rcfile_path = Self::render_rcfile(&flox)?;
 
         Self::print_disclosure(target.name().as_ref());
 
@@ -220,11 +251,50 @@ impl Develop {
         }
 
         let mut command = Command::new(&*INTERACTIVE_BASH_BIN);
-        command.arg("--rcfile").arg(&rcfile_path);
+        // `pname` and the `print-dev-env` script path are passed as
+        // environment variables and referenced by name from the rcfile
+        // (`render_rcfile`) rather than interpolated into its text, so
+        // nothing here needs shell escaping.
+        command.env("_FLOX_DEVELOP_PNAME", target.name().as_ref());
+        command.env("_FLOX_DEVELOP_ENV_SCRIPT", &env_script_path);
+        // `bash --rcfile` only reads the file for an interactive shell, and
+        // bash decides interactivity from whether stdin and stderr are
+        // ttys — not from `--rcfile` being present. Piped/redirected
+        // invocations (`flox develop pkg < /dev/null`, `... 2>log`) would
+        // otherwise silently land the caller in a plain host shell with no
+        // build environment. `-i` forces interactive mode regardless of
+        // tty status; `--noprofile` matches the equivalent branch in
+        // `flox-activations/src/attach.rs` (`activate_interactive`) that
+        // also has to force an rcfile-sourcing shell for non-tty callers.
+        // `-i` must come after `--rcfile`: this bash rejects it as `--:
+        // invalid option` when it precedes a long option.
+        command
+            .arg("--noprofile")
+            .arg("--rcfile")
+            .arg(&rcfile_path)
+            .arg("-i");
         debug!(command = ?command, "exec'ing development shell");
 
         // exec should never return
         Err(command.exec()).context("failed to exec development shell")
+    }
+
+    /// A pushed or pulled (FloxHub-linked) environment cannot be assumed to
+    /// have its project files — the `.flox/pkgs/` expression and the git
+    /// history `develop` needs to locate and hash it — available locally,
+    /// so this reuses the same refusal `flox build`/`flox publish` give a
+    /// managed environment.
+    fn refuse_managed_environment(env: &ConcreteEnvironment) -> Result<()> {
+        match env {
+            ConcreteEnvironment::Path(_) => Ok(()),
+            ConcreteEnvironment::Managed(managed) => {
+                bail!(needs_project_files_error(managed, "develop"))
+            },
+            ConcreteEnvironment::Remote(_) => {
+                // guarded by DirEnvironmentSelect
+                unreachable!("Cannot develop from a remote environment")
+            },
+        }
     }
 
     /// An unsandboxed manifest build already runs against the activated
@@ -260,10 +330,35 @@ impl Develop {
     fn print_dev_env(flox: &Flox, drv_path: &Path, pname: &str) -> Result<PathBuf, DevelopError> {
         let mut cmd = nix::nix_base_command();
         cmd.arg("print-dev-env").arg(drv_path);
+        cmd.stdout(Stdio::piped());
+        // `Command::output()` always pipes both streams (overriding any
+        // `Stdio` set beforehand), which buffers nix's build/eval progress
+        // out of sight for however long a cold store takes to realise the
+        // derivation's inputs. Spawning directly and inheriting stderr
+        // keeps that progress visible; stdout is piped straight to the
+        // env-script file below instead of held in memory.
+        cmd.stderr(Stdio::inherit());
 
-        let output = cmd.output().map_err(DevelopError::CallPrintDevEnv)?;
+        let mut child = cmd.spawn().map_err(DevelopError::CallPrintDevEnv)?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .expect("stdout is piped by cmd.stdout(Stdio::piped()) above");
 
-        if !output.status.success() {
+        let env_script_path = NamedTempFile::new_in(&flox.temp_dir)
+            .map_err(DevelopError::CreateEnvScriptFile)?
+            .into_temp_path();
+        // SAFETY: according to the docs, this is fallible on _Windows_
+        let env_script_path = env_script_path
+            .keep()
+            .expect("failed to keep env script file");
+        let mut env_script_file =
+            std::fs::File::create(&env_script_path).map_err(DevelopError::CreateEnvScriptFile)?;
+        io::copy(&mut stdout, &mut env_script_file).map_err(DevelopError::CreateEnvScriptFile)?;
+
+        let status = child.wait().map_err(DevelopError::CallPrintDevEnv)?;
+
+        if !status.success() {
             // The `drvPath` is not GC-rooted between the eval above and this
             // call, and this window is longer than the one the makefile's
             // own `build` goal guards internally. A pre-flight existence
@@ -275,21 +370,14 @@ impl Develop {
                     pname: pname.to_string(),
                 });
             }
+            // stderr was inherited above, so nix's own failure output is
+            // already on the terminal; embedding it here too would violate
+            // this repo's rule against surfacing internal tool output
+            // (AGENTS.md).
             return Err(DevelopError::PrintDevEnv {
                 pname: pname.to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
         }
-
-        let env_script_path = NamedTempFile::new_in(&flox.temp_dir)
-            .map_err(DevelopError::CreateEnvScriptFile)?
-            .into_temp_path();
-        // SAFETY: according to the docs, this is fallible on _Windows_
-        let env_script_path = env_script_path
-            .keep()
-            .expect("failed to keep env script file");
-        std::fs::write(&env_script_path, &output.stdout)
-            .map_err(DevelopError::CreateEnvScriptFile)?;
 
         Ok(env_script_path)
     }
@@ -303,71 +391,76 @@ impl Develop {
     /// sourced, so `~/.bashrc` must run first or the user's own `PATH`
     /// entries land in front of the build inputs and shadow the build's
     /// toolchain.
-    fn render_rcfile(
-        flox: &Flox,
-        env_script_path: &Path,
-        pname: &str,
-    ) -> Result<PathBuf, DevelopError> {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let bashrc_block = match &home {
-            Some(home) => formatdoc! {r#"
-                # 1. User config first — REQUIRED to be first. The env script
-                #    sourced below overwrites PATH with the build inputs and then
-                #    appends whatever PATH was live when it was sourced. Run
-                #    ~/.bashrc afterwards instead and the user's own PATH entries
-                #    land in front of the build inputs, shadowing the build's
-                #    toolchain.
-                #
-                #    _flox_sourcing_rc is the guard flox's own activation rcfile
-                #    sets (flox-activations/src/gen_rc/bash.rs), read back at
-                #    attach.rs. It stops a subshell 'flox activate' inside
-                #    ~/.bashrc from re-sourcing ~/.bashrc from inside this very
-                #    sourcing. It does NOT suppress the activation itself — see
-                #    the disclosure printed before this shell's prompt.
-                if [ -n "${{PS1:-}}" ] && [ -f "{home}/.bashrc" ]; then
-                  export _flox_sourcing_rc=true
-                  source "{home}/.bashrc"
-                  unset _flox_sourcing_rc
-                fi
-                "#, home = home.display()},
-            None => String::new(),
-        };
-
+    fn render_rcfile(flox: &Flox) -> Result<PathBuf, DevelopError> {
+        // `pname` (from `showAttrPath`, which Nix-quotes non-identifier
+        // names and passes characters like backticks through verbatim —
+        // e.g. a package file named `` `id`.nix ``) and the env-script path
+        // both need to reach the rcfile below. The prompt line embeds
+        // `pname` *inside* an already-double-quoted assignment, where
+        // backticks and `$(...)` are still live, so quoting `pname` at the
+        // Rust level can't neutralize them — only keeping the value out of
+        // the file's text does. Both are passed as environment variables
+        // (set on the exec'd `Command` in `develop()`) and referenced here
+        // by name instead of being interpolated into the generated source.
         let rcfile_content = formatdoc! {r#"
-            {bashrc_block}
+            # 1. User config first — REQUIRED to be first. The env script
+            #    sourced below overwrites PATH with the build inputs and then
+            #    appends whatever PATH was live when it was sourced. Run
+            #    ~/.bashrc afterwards instead and the user's own PATH entries
+            #    land in front of the build inputs, shadowing the build's
+            #    toolchain. `$HOME` is read directly by the shell that
+            #    sources this file rather than interpolated here, so a
+            #    non-UTF-8 `$HOME` still resolves correctly instead of
+            #    silently failing the `-f` test below.
+            #
+            #    _flox_sourcing_rc is the guard flox's own activation rcfile
+            #    sets (flox-activations/src/gen_rc/bash.rs), read back at
+            #    attach.rs. It stops a subshell 'flox activate' inside
+            #    ~/.bashrc from re-sourcing ~/.bashrc from inside this very
+            #    sourcing. It does NOT suppress the activation itself — see
+            #    the disclosure printed before this shell's prompt.
+            if [ -n "${{PS1:-}}" ] && [ -f "$HOME/.bashrc" ]; then
+              export _flox_sourcing_rc=true
+              source "$HOME/.bashrc"
+              unset _flox_sourcing_rc
+            fi
+
             # 2. The `nix print-dev-env` output: build inputs, stdenv
             #    functions, NIX_BUILD_TOP/TMPDIR fixups, shellHook eval. It
             #    sets nix_saved_PATH/nix_saved_XDG_DATA_DIRS itself, from the
             #    PATH live at this point — this rcfile must not pre-set or
             #    clobber them.
-            source "{env_script_path}"
+            source "${{_FLOX_DEVELOP_ENV_SCRIPT}}"
 
             # 3. Flox prompt: wrap the existing PS1, never replace it. This
             #    duplicates the wrap-not-replace logic in
             #    assets/environment-interpreter/activate/activate.d/set-prompt.bash
             #    rather than sourcing it: that asset depends on activation-time
             #    state (FLOX_PROMPT_ENVIRONMENTS, _activate_d) a develop shell
-            #    never sets.
+            #    never sets. The saved-PS1 variable is develop-private
+            #    (`_FLOX_DEVELOP_SAVE_PS1`, not `FLOX_SAVE_BASH_PS1`):
+            #    `set-prompt.bash` reads and clears the shared name on
+            #    `flox deactivate`, and a `~/.bashrc` that runs `flox
+            #    activate` would otherwise both capture this shell's
+            #    already-marked prompt as the "original" one and have its
+            #    own restore wipe this shell's marker out from under it.
             if [ -n "${{PS1:-}}" ]; then
-              if [ -z "${{FLOX_SAVE_BASH_PS1:-}}" ]; then
-                export FLOX_SAVE_BASH_PS1="$PS1"
+              if [ -z "${{_FLOX_DEVELOP_SAVE_PS1:-}}" ]; then
+                export _FLOX_DEVELOP_SAVE_PS1="$PS1"
               fi
               if [ "${{NO_COLOR:-0}}" = "0" ]; then
-                __flox_develop_marker="\[\e[1m\]flox [develop: {pname}]\[\e[0m\] "
+                __flox_develop_marker="\[\e[1m\]flox [develop: ${{_FLOX_DEVELOP_PNAME}}]\[\e[0m\] "
               else
-                __flox_develop_marker="flox [develop: {pname}] "
+                __flox_develop_marker="flox [develop: ${{_FLOX_DEVELOP_PNAME}}] "
               fi
-              case "$FLOX_SAVE_BASH_PS1" in
-                *\\n*) PS1="${{FLOX_SAVE_BASH_PS1/\\n/\\n$__flox_develop_marker}}" ;;
-                *\\012*) PS1="${{FLOX_SAVE_BASH_PS1/\\012/\\012$__flox_develop_marker}}" ;;
-                *) PS1="$__flox_develop_marker$FLOX_SAVE_BASH_PS1" ;;
+              case "$_FLOX_DEVELOP_SAVE_PS1" in
+                *\\n*) PS1="${{_FLOX_DEVELOP_SAVE_PS1/\\n/\\n$__flox_develop_marker}}" ;;
+                *\\012*) PS1="${{_FLOX_DEVELOP_SAVE_PS1/\\012/\\012$__flox_develop_marker}}" ;;
+                *) PS1="$__flox_develop_marker$_FLOX_DEVELOP_SAVE_PS1" ;;
               esac
               unset __flox_develop_marker
             fi
-            "#,
-            bashrc_block = bashrc_block,
-            env_script_path = env_script_path.display(),
-            pname = pname,
+            "#
         };
 
         let rcfile_path = NamedTempFile::new_in(&flox.temp_dir)
@@ -389,17 +482,17 @@ impl Develop {
 
 #[derive(Debug, Error)]
 pub(crate) enum DevelopError {
-    #[error("Failed to call 'nix print-dev-env'")]
+    #[error("Failed to call 'nix print-dev-env'.")]
     CallPrintDevEnv(#[source] std::io::Error),
 
-    #[error("failed to write the development shell's environment script")]
+    #[error("Failed to write the development shell's environment script.")]
     CreateEnvScriptFile(#[source] std::io::Error),
 
-    #[error("failed to write the development shell's rcfile")]
+    #[error("Failed to write the development shell's rcfile.")]
     CreateRcFile(#[source] std::io::Error),
 
-    #[error("Failed to build the development environment for '{pname}'\n{stderr}")]
-    PrintDevEnv { pname: String, stderr: String },
+    #[error("Failed to build the development environment for '{pname}'.")]
+    PrintDevEnv { pname: String },
 
     #[error(
         "The derivation for '{pname}' was garbage collected between evaluation and use.\nPlease try again."
@@ -409,10 +502,30 @@ pub(crate) enum DevelopError {
 
 #[cfg(test)]
 mod tests {
-    use flox_rust_sdk::flox::test_helpers::flox_instance;
+    use flox_rust_sdk::flox::test_helpers::{flox_instance, flox_instance_with_optional_floxhub};
+    use flox_rust_sdk::models::environment::managed_environment::test_helpers::mock_managed_environment_in;
     use flox_rust_sdk::providers::build::{ExpressionBuildMetadata, PackageTargetKind};
 
     use super::*;
+
+    /// A pushed/pulled environment is refused with the same
+    /// `needs_project_files_error` message `flox build`/`flox publish`
+    /// give, naming FloxHub and the `flox pull --copy` escape hatch.
+    #[test]
+    fn refuse_managed_environment_names_floxhub_and_pull_copy() {
+        let owner = "owner".parse().unwrap();
+        let (flox, tempdir) = flox_instance_with_optional_floxhub(Some(&owner));
+        let environment_path = tempdir.path().join("environment");
+        std::fs::create_dir(&environment_path).unwrap();
+        let managed =
+            mock_managed_environment_in(&flox, "version = 1\n", owner, &environment_path, None);
+
+        let message = Develop::refuse_managed_environment(&ConcreteEnvironment::Managed(managed))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("FloxHub"));
+        assert!(message.contains("flox pull --copy"));
+    }
 
     #[test]
     fn refuse_manifest_build_allows_expression_builds() {

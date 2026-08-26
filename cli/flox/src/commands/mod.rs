@@ -2061,11 +2061,20 @@ mod subcommand_name_tests {
         assert_eq!(command.subcommand_name(), "build::update-catalogs");
     }
 
-    /// `flox develop <package>` reaches the new command's package form.
+    /// `flox develop <package>` reaches the new command's package form and
+    /// captures the package name itself, not only the wire name of the
+    /// branch it dispatches to.
     #[test]
     fn develop_package_form_derives_to_develop() {
+        use super::develop::Develop;
+
         let command = parse_command(&["develop", "hello"]);
         assert_eq!(command.subcommand_name(), "develop");
+
+        let Commands::Use(UseCommands::Develop(Develop::Package(options))) = command else {
+            panic!("expected the package branch");
+        };
+        assert_eq!(options.package, "hello");
     }
 
     /// `flox develop -- <cmd>` must be served by the deprecated `activate`
