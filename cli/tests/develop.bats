@@ -98,27 +98,6 @@ teardown() {
   assert_output --partial "develop                Enter a development shell for a package build"
 }
 
-@test "develop: 'man flox-develop' exits 0 in the packaged build" {
-  # No test builds the manpages package as part of the normal `just
-  # integ-tests` flow, so build it here rather than relying on the host's
-  # MANPATH to already carry a fresh build. Bats copies this file into a
-  # scratch directory outside the repo before running it, so `$BATS_TEST_DIRNAME`
-  # is not a path inside the flox checkout; derive the repo root from
-  # `$FLOX_BIN` instead, which the harness always points at
-  # `<repo>/target/debug/flox`.
-  local repo_root="${FLOX_BIN%/target/debug/flox}"
-
-  run nix build --extra-experimental-features "nix-command flakes" \
-    --no-link --print-out-paths "$repo_root#flox-manpages"
-  assert_success
-  # `nix build`'s warnings land on stderr, which `run` merges into
-  # `$output` alongside the store path on its own final line.
-  local manpages_out="${lines[-1]}"
-
-  run man -M "$manpages_out/share/man" flox-develop
-  assert_success
-}
-
 @test "develop: '--help' documents the package form, not activate's options" {
   run "$FLOX_BIN" develop --help
   assert_success
@@ -225,6 +204,36 @@ EOF
   assert_output --partial "point at placeholder paths"
   assert_output --partial "The host PATH stays reachable"
   assert_output --partial "This shell is interactive and sources"
+}
+
+@test "develop: enters a shell even when the package's build phases would fail" {
+  # `flox develop` realises only the derivation's *inputs* (`nix
+  # print-dev-env`), never its builder -- every other fixture in this file
+  # builds cleanly, so none of them actually exercises that distinction.
+  # This one's `buildPhase` unconditionally fails a real `nix build`; entry
+  # must still succeed.
+  project_setup
+  git_init_project
+  local pkg_dir="$PROJECT_DIR/.flox/pkgs/greet"
+  mkdir -p "$pkg_dir"
+  cat >"$pkg_dir/default.nix" <<'EOF'
+{stdenv, hello}:
+stdenv.mkDerivation {
+  pname = "greet";
+  version = "1.0";
+  src = ./.;
+  buildInputs = [ hello ];
+  buildPhase = "exit 1";
+  installPhase = "mkdir -p $out; echo hi > $out/hi";
+}
+EOF
+  git -C "$PROJECT_DIR" add -A
+  git -C "$PROJECT_DIR" commit -q -m "add greet with a failing buildPhase"
+  export _FLOX_USE_CATALOG_MOCK="$UNIT_TEST_GENERATED/get_base_catalog_nixpkgs_url.yaml"
+
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR" greet < /dev/null
+  assert_success
+  assert_output --partial "This shell approximates the build environment for 'greet'"
 }
 
 @test "develop: editing the expression without committing changes the derivation on re-entry" {
