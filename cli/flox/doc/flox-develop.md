@@ -111,6 +111,18 @@ on every entry:
 - This shell is interactive and sources `~/.bashrc`. The build shell
   does neither.
 
+## Known limitations
+
+- The shell is always `bash`, regardless of `$FLOX_SHELL` or `$SHELL`,
+  and only `~/.bashrc` is sourced — a `~/.zshrc`, `~/.config/fish/`, or
+  other shell's startup files are not.
+- Nothing keeps the derivation or its build inputs from being garbage
+  collected while the shell is open, the same as a plain
+  `nix develop`. If a concurrent `nix-collect-garbage` (or similar)
+  removes them mid-session, commands that depend on the build inputs
+  will start failing; re-run `flox develop <package>` to get a fresh
+  shell.
+
 ## Deprecated: `flox develop` without a package
 
 `flox develop` without a package argument, or followed by `--
