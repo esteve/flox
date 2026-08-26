@@ -86,6 +86,19 @@ jobs:
 
     outputs:
       heavy: "${{ steps.classify.outputs.heavy }}"
+      # "false" when this run must not spend time on x86_64-darwin.
+      #
+      # Read by the `nix-build` and `nix-build-bats-tests` steps below
+      # through the same `!= 'false'` test as `heavy`, so the fail-open
+      # posture documented above applies unchanged: an empty verdict — a
+      # skipped `scope`, a failed `scope`, a future event that reaches
+      # neither — runs x86_64-darwin. Only a literal "false" suppresses it.
+      #
+      # That is what makes `push` correct without naming it: `scope` is
+      # skipped on `push` and `workflow_dispatch` by the `if` above, so
+      # this is empty there, so the push to `main` that feeds
+      # `trigger-flox-installers-workflow` builds x86_64-darwin in full.
+      x86-darwin: "${{ steps.x86-darwin.outputs.x86-darwin }}"
 
     steps:
       - name: "Checkout"
@@ -132,6 +145,34 @@ jobs:
           PR_BASE_REF: "${{ github.base_ref }}"
           PR_NUMBER: "${{ github.event.pull_request.number }}"
         run: ./.github/scripts/classify-ci-scope.sh
+
+      - name: "Should this run spend time on x86_64-darwin?"
+        id: "x86-darwin"
+        # x86_64-darwin serves ~3% of users, is the slowest leg of this
+        # workflow and the one that flakes most (OPS-43), and has produced
+        # few platform-specific bugs. CLI-148: pay for it where a
+        # regression would reach users, not on every pull request.
+        #
+        # `FLOX_RUNNING_RELEASE` is read rather than recomputed. Its
+        # definition at the top of this file — a pull request to or from a
+        # `release-*` branch — is already the condition wanted here, and
+        # reading it keeps one predicate instead of two that could drift.
+        # Note the reverse coupling: changing that variable now also
+        # changes what CI spends on x86_64-darwin.
+        #
+        # A `merge_group` run lands on "false", because `head_ref` and
+        # `base_ref` are empty outside `pull_request`. That is intended:
+        # the pull request already did this work, and the push to `main`
+        # will do it again.
+        #
+        # Deliberately *not* also a "did the diff touch VERSION?" check.
+        # `cz bump` only ever writes VERSION on a release branch —
+        # `release.sh` aborts anywhere else — so every VERSION change is
+        # already a release-branch pull request and the extra signal would
+        # widen nothing.
+        run: |
+          echo "x86-darwin=$FLOX_RUNNING_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "\`x86-darwin=$FLOX_RUNNING_RELEASE\`" >> "$GITHUB_STEP_SUMMARY"
 
   nix-plugins-dev:
     name: "Nix Plugins"
@@ -359,6 +400,21 @@ jobs:
       closure-size-aarch64-darwin: ${{ steps.closure.outputs.closure-size-aarch64-darwin }}
       flox-version: ${{ steps.version.outputs.flox-version }}
 
+    # `x86_64-darwin` stays in this matrix even though most runs no longer
+    # build it. Do not "clean up" by dropping the entry or by making the
+    # list conditional.
+    #
+    # `Nix build (x86_64-darwin)` is a required status check in the `Main
+    # ruleset`. Per the `scope` job above, a leg that is absent from the
+    # matrix never *creates* its context — an uncreated context is not a
+    # pending one — and the merge queue ejects the pull request on a
+    # status-check timeout. So the leg runs on every run and posts a green
+    # context after a checkout; only its expensive steps are gated, by
+    # `needs.scope.outputs.x86-darwin` (CLI-148).
+    #
+    # Step-gating also keeps this job's `result` at 'success', which
+    # `nix-build-bats-tests` and `report-failure` both key off. A
+    # job-level skip would make it 'skipped' and cascade.
     strategy:
       fail-fast: false
       matrix:
@@ -384,7 +440,7 @@ jobs:
           wait-timeout-minutes: 15
 
       - name: "Setup"
-        if: ${{ needs.scope.outputs.heavy != 'false' }}
+        if: ${{ needs.scope.outputs.heavy != 'false' && (matrix.system != 'x86_64-darwin' || needs.scope.outputs.x86-darwin != 'false') }}
         uses: "./.github/actions/common-setup"
         with:
           GITHUB_ACCESS_TOKEN: "${{ secrets.MANAGED_FLOXBOT_GITHUB_ACCESS_TOKEN_REPO_SCOPE }}"
@@ -400,7 +456,7 @@ jobs:
           SETUP_NIX: "false"
 
       - name: "Configure AWS Credentials"
-        if: ${{ needs.scope.outputs.heavy != 'false' }}
+        if: ${{ needs.scope.outputs.heavy != 'false' && (matrix.system != 'x86_64-darwin' || needs.scope.outputs.x86-darwin != 'false') }}
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6
         with:
           role-to-assume: "arn:aws:iam::759020684799:role/github-oidc-role-flox-cache-public"
@@ -411,7 +467,7 @@ jobs:
 
       - name: "Build"
         id: "build"
-        if: ${{ needs.scope.outputs.heavy != 'false' }}
+        if: ${{ needs.scope.outputs.heavy != 'false' && (matrix.system != 'x86_64-darwin' || needs.scope.outputs.x86-darwin != 'false') }}
         env:
           NIX_SUBSTITUTER: "${{ vars.MANAGED_CACHE_PUBLIC_S3_BUCKET }}"
           NIX_SUBSTITUTER_KEY: "${{ secrets.MANAGED_CACHE_PUBLIC_SECRET_KEY }}"
@@ -546,6 +602,19 @@ jobs:
     # for the `push` event.
     if: ${{ !cancelled() && needs.nix-build.result == 'success' && !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
+    # The `x86_64-darwin` entry under `include` below is gated by the same
+    # `scope` output as the build leg above, and that shared output is what
+    # keeps the two coupled. `remote-execute-integration-tests.sh` runs
+    # `packages.<system>.flox-cli-tests` on the shared Darwin builder, and
+    # it substitutes quickly only because the `nix-build` leg populated the
+    # public cache first. Tests on a run that skipped that build would put
+    # a full cold build on the scarce builder — the opposite of CLI-148.
+    #
+    # `remote (x86_64-darwin, …)` is *not* a required context, so unlike
+    # the build leg this one could have been dropped from the matrix
+    # outright. It is step-gated anyway, so this file has exactly one
+    # mechanism for suppressing x86_64-darwin work: the one that is also
+    # safe for the required leg above.
     strategy:
       fail-fast: false
       matrix:
@@ -583,7 +652,7 @@ jobs:
           wait-timeout-minutes: 15
 
       - name: "Setup"
-        if: ${{ needs.scope.outputs.heavy != 'false' }}
+        if: ${{ needs.scope.outputs.heavy != 'false' && (matrix.system != 'x86_64-darwin' || needs.scope.outputs.x86-darwin != 'false') }}
         uses: "./.github/actions/common-setup"
         with:
           GITHUB_ACCESS_TOKEN: "${{ secrets.MANAGED_FLOXBOT_GITHUB_ACCESS_TOKEN_REPO_SCOPE }}"
@@ -599,7 +668,7 @@ jobs:
 
       - name: "Run Bats Tests (./#flox-cli-tests)"
         timeout-minutes: 30
-        if: ${{ needs.scope.outputs.heavy != 'false' }}
+        if: ${{ needs.scope.outputs.heavy != 'false' && (matrix.system != 'x86_64-darwin' || needs.scope.outputs.x86-darwin != 'false') }}
         env:
           MATRIX_SYSTEM: ${{ matrix.system }}
           MATRIX_TEST_TAGS: ${{ matrix.test-tags }}
