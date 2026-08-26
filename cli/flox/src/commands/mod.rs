@@ -7,6 +7,7 @@ mod check_for_upgrades;
 mod containerize;
 mod deactivate;
 mod delete;
+mod develop;
 mod edit;
 mod envs;
 mod factory;
@@ -810,7 +811,6 @@ enum UseCommands {
     /// Enter the environment, run 'flox deactivate' to leave
     #[bpaf(
         command,
-        long("develop"),
         header(indoc! {"
             When called with no arguments 'flox activate' will look for a '.flox' directory
             in the current directory. Calling 'flox activate' in your home directory will
@@ -820,6 +820,10 @@ enum UseCommands {
         footer("Run 'man flox-activate' for more details.")
     )]
     Activate(#[bpaf(external(activate::activate))] activate::Activate),
+
+    /// Enter a development shell for a package build
+    #[bpaf(command, footer("Run 'man flox-develop' for more details."))]
+    Develop(#[bpaf(external(develop::develop))] develop::Develop),
 
     /// Deactivate the current environment
     #[bpaf(command, long("exit"))]
@@ -844,6 +848,7 @@ impl UseCommands {
     async fn handle(self, config: Config, flox: Flox) -> Result<()> {
         match self {
             UseCommands::Activate(args) => args.handle(config, flox).await,
+            UseCommands::Develop(args) => args.handle(config, flox).await,
             UseCommands::Deactivate(args) => args.handle(config, flox),
             UseCommands::Run(args) => args.handle(config, flox).await,
             UseCommands::Services(args) => args.handle(config, flox).await,
@@ -853,6 +858,7 @@ impl UseCommands {
     fn subcommand_name(&self) -> &'static str {
         match self {
             UseCommands::Activate(args) => args.subcommand_name(),
+            UseCommands::Develop(args) => args.subcommand_name(),
             UseCommands::Deactivate(_) => "deactivate",
             UseCommands::Run(_) => "run",
             UseCommands::Services(sub) => sub.subcommand_name(),
@@ -2053,6 +2059,70 @@ mod subcommand_name_tests {
     fn build_update_catalogs_uses_parent_child_join_encoding() {
         let command = parse_command(&["build", "update-catalogs"]);
         assert_eq!(command.subcommand_name(), "build::update-catalogs");
+    }
+
+    /// `flox develop <package>` reaches the new command's package form.
+    #[test]
+    fn develop_package_form_derives_to_develop() {
+        let command = parse_command(&["develop", "hello"]);
+        assert_eq!(command.subcommand_name(), "develop");
+    }
+
+    /// `flox develop -- <cmd>` must be served by the deprecated `activate`
+    /// branch, not the package positional. The package positional carries
+    /// `non_strict`, which rejects any position to the right of `--` by
+    /// construction; without it both branches would parse and bpaf's own
+    /// tie-break would decide, which is not a property this crate controls.
+    /// This asserts the outcome — the exec command bpaf actually parsed —
+    /// so the test fails if `non_strict` is ever dropped and the tie-break
+    /// happens to swing the other way, rather than asserting a parser
+    /// attribute that could be present and ineffective.
+    #[test]
+    fn develop_dash_dash_reaches_deprecated_activate_branch() {
+        use super::activate::{ActivateSubcommandOrOptions, CommandSelect};
+        use super::develop::Develop;
+
+        let command = parse_command(&["develop", "--", "true"]);
+        let Commands::Use(UseCommands::Develop(Develop::DeprecatedActivate(activate))) = command
+        else {
+            panic!("expected the deprecated activate branch");
+        };
+        let ActivateSubcommandOrOptions::ActivateOptions { options } =
+            activate.subcommand_or_options
+        else {
+            panic!("expected activate options, not an auto-activate subcommand");
+        };
+        let Some(CommandSelect::ExecCommand { command, .. }) = options.command else {
+            panic!("expected an exec command");
+        };
+        assert_eq!(command, "true");
+    }
+
+    /// A bare `flox develop` (no package, no `--`) has no positional to
+    /// parse and falls through to the deprecated `activate` branch, which
+    /// delegates its wire name — the alias behaves exactly as it does
+    /// today, telemetry included.
+    #[test]
+    fn develop_without_package_delegates_to_activate_subcommand_name() {
+        let command = parse_command(&["develop"]);
+        assert_eq!(command.subcommand_name(), "activate");
+    }
+
+    /// `flox develop allow` / `flox develop deny` reach the deprecated
+    /// branch's nested auto-activate commands (bpaf's depth rule prefers
+    /// the branch that consumed a command), so they keep the existing
+    /// `activate::allow` / `activate::deny` wire names rather than
+    /// colliding with a package literally named `allow` or `deny`.
+    #[test]
+    fn develop_allow_delegates_to_activate_allow_subcommand_name() {
+        let command = parse_command(&["develop", "allow"]);
+        assert_eq!(command.subcommand_name(), "activate::allow");
+    }
+
+    #[test]
+    fn develop_deny_delegates_to_activate_deny_subcommand_name() {
+        let command = parse_command(&["develop", "deny"]);
+        assert_eq!(command.subcommand_name(), "activate::deny");
     }
 }
 

@@ -1,0 +1,68 @@
+# Enter a development shell for a git-tracked Nix expression package and
+# check:
+# - the shell is interactive, with stdenv's build machinery loaded
+# - the prompt names the package and preserves the prior prompt
+# - a host-PATH-only tool stays reachable, and a build-input tool of the
+#   same name as a host tool wins (the `~/.bashrc`-before-env-script
+#   ordering this depends on)
+# - `$src` is a store snapshot: editing the tracked expression file in the
+#   working tree does not change what is already unpacked there
+# - leaving the shell restores the parent prompt and PATH
+
+set dir [lindex $argv 0]
+set pname [lindex $argv 1]
+set flox $env(FLOX_BIN)
+set env(NO_COLOR) 1
+set env(TERM) xterm-mono
+set stty_init "cols 1000"
+
+set timeout 30
+exp_internal 1
+
+spawn $flox develop --dir $dir $pname
+expect_after {
+  timeout { exit 1 }
+  eof { exit 2 }
+  "*\n" { exp_continue }
+  "*\r" { exp_continue }
+}
+
+# Prompt names the package and preserves the prior (host) prompt.
+expect "flox \\\[develop: $pname\\\]"
+expect $env(KNOWN_PROMPT)
+
+# stdenv's build machinery is loaded.
+send "declare -F genericBuild buildPhase unpackPhase installPhase\n"
+expect "genericBuild"
+expect "buildPhase"
+expect "unpackPhase"
+expect "installPhase"
+
+# The shell has interactive ergonomics.
+send "case \$- in *i*) echo IS_INTERACTIVE;; esac\n"
+expect "IS_INTERACTIVE"
+
+# A host-PATH-only tool is still resolvable...
+send "command -v my-marker-tool && echo MARKER_FOUND\n"
+expect "MARKER_FOUND"
+
+# ...and a build-input tool of the same name as a host tool wins over the
+# host one, which is what the `~/.bashrc`-before-env-script ordering buys.
+send "hello\n"
+expect "Hello, world!"
+
+# `$src` is a snapshot: it is a store path, and an edit made to the
+# tracked expression file in the working tree *after* entering this shell
+# is not visible inside it.
+send "echo SRC_PATH:\$src\n"
+expect -re {SRC_PATH:(/nix/store/\S+)}
+set src_path $expect_out(1,string)
+
+send "echo EDIT_MARKER >> .flox/pkgs/$pname/default.nix\n"
+expect $env(KNOWN_PROMPT)
+
+send "grep -c EDIT_MARKER $src_path/default.nix || echo EDIT_NOT_IN_SRC\n"
+expect "EDIT_NOT_IN_SRC"
+
+send "exit\n"
+expect eof
