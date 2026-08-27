@@ -16,7 +16,6 @@ use flox_rust_sdk::providers::build::{
     ManifestBuilder,
     PackageTarget,
     PackageTargetKind,
-    PackageTargets,
     nix_expression_dir,
 };
 use flox_rust_sdk::providers::catalog_lock::BuildCatalogLock;
@@ -234,6 +233,15 @@ impl Develop {
     /// candidates for that fallback — `refuse_manifest_build` below
     /// refuses one unconditionally, so silently falling into one here
     /// would only relocate that refusal to a worse error.
+    ///
+    /// The zero-candidate case has two causes, and `packages_to_build`
+    /// distinguishes them for free: called with an empty package list, it
+    /// bails with its own "No packages found to build." before this
+    /// function sees anything if the project defines no builds at all, so
+    /// an empty `expression_targets` here only ever means the project has
+    /// manifest builds and nothing else — the one case that needs its own
+    /// message, pointing at `flox activate` the same way
+    /// `refuse_manifest_build` does for a named manifest build.
     fn resolve_target(
         manifest: &Manifest<MigratedTypedOnly>,
         expression_ref: &NixFlakeref,
@@ -248,18 +256,20 @@ impl Develop {
         }
 
         let mut expression_targets: Vec<PackageTarget> =
-            PackageTargets::new(manifest, expression_ref)?
-                .all()
+            packages_to_build(manifest, expression_ref, &Vec::<String>::new())?
                 .into_iter()
                 .filter(|target| target.kind().is_expression_build())
                 .collect();
 
         match expression_targets.len() {
             0 => bail!(formatdoc! {"
-                No Nix expression package found to develop.
+                This project defines manifest builds but no Nix expression build to develop.
+                An unsandboxed manifest build already runs against the activated environment,
+                so the shell it would get is one you can enter today.
 
-                Add one by creating a file under '{expression_ref}'.
-                ", expression_ref = expression_ref.as_url()
+                Next:
+                  $ flox activate
+                "
             }),
             1 => Ok(expression_targets.remove(0)),
             _ => {
@@ -611,16 +621,21 @@ mod tests {
         let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
         let lockfile_manifest = lockfile.migrated_manifest().unwrap();
 
+        // Joined in sorted order ("farewell" before "greet"), not insertion
+        // or `HashMap` iteration order: a `--partial` check for each name
+        // separately would still pass if the sort in `resolve_target` were
+        // deleted, since both names appear either way.
         let message = Develop::resolve_target(&lockfile_manifest, &expression_ref, None)
             .unwrap_err()
             .to_string();
-        assert!(message.contains("greet"));
-        assert!(message.contains("farewell"));
+        assert!(message.contains("farewell, greet"));
     }
 
-    /// With no Nix expression builds at all, a bare `flox develop` is
-    /// refused rather than silently falling back to the alias's old
-    /// `flox activate` behavior, which no longer exists.
+    /// With no Nix expression builds and no manifest builds either, a bare
+    /// `flox develop` is refused with `packages_to_build`'s own "no
+    /// packages found" error -- the same one `flox build` gets for the
+    /// same project state -- rather than a second message for the same
+    /// condition.
     #[test]
     fn resolve_target_errors_when_no_expression_builds_exist() {
         let (flox, _tempdir) = flox_instance();
@@ -629,16 +644,21 @@ mod tests {
         let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
         let lockfile_manifest = lockfile.migrated_manifest().unwrap();
 
-        let result = Develop::resolve_target(&lockfile_manifest, expression_ref, None);
-        assert!(result.is_err());
+        let message = Develop::resolve_target(&lockfile_manifest, expression_ref, None)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("No packages found to build"));
     }
 
     /// A manifest build is not a candidate for the bare-invocation
     /// fallback: entering its shell unconditionally is the job
-    /// `refuse_manifest_build` already refuses, so a project with only a
-    /// manifest build must fail the same way a project with none does.
+    /// `refuse_manifest_build` already refuses. Unlike a project with no
+    /// builds at all, this project has something to build -- just not
+    /// with `flox develop` -- so the refusal must say so and point at
+    /// `flox activate` instead of repeating the "no packages found"
+    /// message a genuinely empty project gets.
     #[test]
-    fn resolve_target_ignores_manifest_builds_for_bare_invocation() {
+    fn resolve_target_points_at_activate_when_only_manifest_builds_exist() {
         let (flox, _tempdir) = flox_instance();
         let manifest = formatdoc! {r#"
             version = 1
@@ -651,8 +671,11 @@ mod tests {
         let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
         let lockfile_manifest = lockfile.migrated_manifest().unwrap();
 
-        let result = Develop::resolve_target(&lockfile_manifest, expression_ref, None);
-        assert!(result.is_err());
+        let message = Develop::resolve_target(&lockfile_manifest, expression_ref, None)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("flox activate"));
+        assert!(!message.contains("No packages found to build"));
     }
 
     /// A named package is still validated against the environment's known

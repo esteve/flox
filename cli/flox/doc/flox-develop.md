@@ -125,12 +125,21 @@ on every entry:
 
 ## Omitting `<package>`
 
-`flox develop` without a package argument resolves the project's Nix
-expression build the same way [`flox-build(1)`](./flox-build.md)
-does: with exactly one Nix expression build in `.flox/pkgs/`, that
-build is entered. With more than one, the command refuses and lists
-every candidate so you can name one. With none, it refuses and tells
-you to add one.
+`flox develop` without a package argument mirrors part of
+[`flox-build(1)`](./flox-build.md)'s bare-invocation convention: a
+project with a single Nix expression build in `.flox/pkgs/` needs no
+name for it, the same as `flox build`. The mirror stops there --
+`flox build` with no arguments builds every target it finds, but a
+development shell is singular, so `flox develop` never resolves to
+more than one.
+
+With exactly one Nix expression build, that build is entered. With
+more than one, the command refuses and lists every candidate so you
+can name one. With none, and the project defines manifest builds
+instead, it refuses and points at
+[`flox-activate(1)`](./flox-activate.md). With no builds of either
+kind, it refuses with the same "no packages found" guidance
+`flox build` gives an empty project.
 
 # OPTIONS
 

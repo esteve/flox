@@ -169,15 +169,35 @@ EOF
 # Bare invocation: mirrors 'flox build's own convention of resolving the
 # project's Nix expression build(s) when none is named.
 
-@test "develop: bare invocation refuses with an error when there are no Nix expression builds" {
+@test "develop: bare invocation refuses with 'flox build's own no-packages error when the project defines no builds at all" {
   project_setup
 
   run "$FLOX_BIN" develop -d "$PROJECT_DIR"
   assert_failure
-  assert_output --partial "No Nix expression package found to develop"
+  assert_output --partial "No packages found to build"
 }
 
-@test "develop: bare invocation refuses with an error naming every candidate when there is more than one Nix expression build" {
+@test "develop: bare invocation points at 'flox activate' when the project defines only manifest builds" {
+  project_setup
+  MANIFEST_CONTENTS="$(cat <<'EOF'
+    version = 1
+
+    [build.greet]
+    command = '''
+      mkdir -p $out/bin
+      echo hi > $out/bin/greet
+    '''
+EOF
+  )"
+  echo "$MANIFEST_CONTENTS" | "$FLOX_BIN" edit -d "$PROJECT_DIR" -f -
+
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR"
+  assert_failure
+  assert_output --partial "flox activate"
+  refute_output --partial "No packages found to build"
+}
+
+@test "develop: bare invocation refuses with an error naming every candidate, in sorted order, when there is more than one Nix expression build" {
   project_setup
   git_init_project
   nef_package_setup greet
@@ -185,8 +205,9 @@ EOF
 
   run "$FLOX_BIN" develop -d "$PROJECT_DIR"
   assert_failure
-  assert_output --partial "greet"
-  assert_output --partial "farewell"
+  # Sorted, joined substring: passes iff the candidates are sorted before
+  # being joined, rather than left in `HashMap` iteration order.
+  assert_output --partial "farewell, greet"
 }
 
 @test "develop: bare invocation enters the shell for the project's sole Nix expression build" {
