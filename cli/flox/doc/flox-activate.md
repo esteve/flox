@@ -90,11 +90,6 @@ run [`flox-deactivate(1)`](./flox-deactivate.md).
 Inside a `flox activate` subshell,
 `flox deactivate` is equivalent to `exit`.
 
-`flox develop` with no package argument is a deprecated synonym for
-`flox activate`; see [`flox-develop(1)`](./flox-develop.md) for the
-Nix expression package development shell that name now primarily
-refers to.
-
 # AUTO-ACTIVATION
 
 Auto-activation activates an environment automatically when you enter a

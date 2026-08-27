@@ -848,7 +848,7 @@ impl UseCommands {
     async fn handle(self, config: Config, flox: Flox) -> Result<()> {
         match self {
             UseCommands::Activate(args) => args.handle(config, flox).await,
-            UseCommands::Develop(args) => args.handle(config, flox).await,
+            UseCommands::Develop(args) => args.handle(flox).await,
             UseCommands::Deactivate(args) => args.handle(config, flox),
             UseCommands::Run(args) => args.handle(config, flox).await,
             UseCommands::Services(args) => args.handle(config, flox).await,
@@ -2061,77 +2061,46 @@ mod subcommand_name_tests {
         assert_eq!(command.subcommand_name(), "build::update-catalogs");
     }
 
-    /// `flox develop <package>` reaches the new command's package form and
-    /// captures the package name itself, not only the wire name of the
-    /// branch it dispatches to.
+    /// `flox develop <package>` captures the package name itself, not only
+    /// the wire name it reports.
     #[test]
     fn develop_package_form_derives_to_develop() {
-        use super::develop::Develop;
-
         let command = parse_command(&["develop", "hello"]);
         assert_eq!(command.subcommand_name(), "develop");
 
-        let Commands::Use(UseCommands::Develop(Develop::Package(options))) = command else {
-            panic!("expected the package branch");
+        let Commands::Use(UseCommands::Develop(develop)) = command else {
+            panic!("expected the develop command");
         };
-        assert_eq!(options.package, "hello");
+        assert_eq!(develop.package.as_deref(), Some("hello"));
     }
 
-    /// `flox develop -- <cmd>` must be served by the deprecated `activate`
-    /// branch, not the package positional. The package positional carries
-    /// `non_strict`, which rejects any position to the right of `--` by
-    /// construction; without it both branches would parse and bpaf's own
-    /// tie-break would decide, which is not a property this crate controls.
-    /// This asserts the outcome — the exec command bpaf actually parsed —
-    /// so the test fails if `non_strict` is ever dropped and the tie-break
-    /// happens to swing the other way, rather than asserting a parser
-    /// attribute that could be present and ineffective.
+    /// A bare `flox develop` leaves the package positional unset rather
+    /// than falling through to any other command — the deprecated
+    /// `activate` alias no longer exists, so there is nothing else to
+    /// fall through to.
     #[test]
-    fn develop_dash_dash_reaches_deprecated_activate_branch() {
-        use super::activate::{ActivateSubcommandOrOptions, CommandSelect};
-        use super::develop::Develop;
-
-        let command = parse_command(&["develop", "--", "true"]);
-        let Commands::Use(UseCommands::Develop(Develop::DeprecatedActivate(activate))) = command
-        else {
-            panic!("expected the deprecated activate branch");
-        };
-        let ActivateSubcommandOrOptions::ActivateOptions { options } =
-            activate.subcommand_or_options
-        else {
-            panic!("expected activate options, not an auto-activate subcommand");
-        };
-        let Some(CommandSelect::ExecCommand { command, .. }) = options.command else {
-            panic!("expected an exec command");
-        };
-        assert_eq!(command, "true");
-    }
-
-    /// A bare `flox develop` (no package, no `--`) has no positional to
-    /// parse and falls through to the deprecated `activate` branch, which
-    /// delegates its wire name — the alias behaves exactly as it does
-    /// today, telemetry included.
-    #[test]
-    fn develop_without_package_delegates_to_activate_subcommand_name() {
+    fn develop_without_package_leaves_package_unset() {
         let command = parse_command(&["develop"]);
-        assert_eq!(command.subcommand_name(), "activate");
+        assert_eq!(command.subcommand_name(), "develop");
+
+        let Commands::Use(UseCommands::Develop(develop)) = command else {
+            panic!("expected the develop command");
+        };
+        assert_eq!(develop.package, None);
     }
 
-    /// `flox develop allow` / `flox develop deny` reach the deprecated
-    /// branch's nested auto-activate commands (bpaf's depth rule prefers
-    /// the branch that consumed a command), so they keep the existing
-    /// `activate::allow` / `activate::deny` wire names rather than
-    /// colliding with a package literally named `allow` or `deny`.
+    /// `allow` and `deny` are ordinary package names now that the
+    /// deprecated `activate` alias — the only reason they were ever
+    /// reserved — is gone.
     #[test]
-    fn develop_allow_delegates_to_activate_allow_subcommand_name() {
-        let command = parse_command(&["develop", "allow"]);
-        assert_eq!(command.subcommand_name(), "activate::allow");
-    }
-
-    #[test]
-    fn develop_deny_delegates_to_activate_deny_subcommand_name() {
-        let command = parse_command(&["develop", "deny"]);
-        assert_eq!(command.subcommand_name(), "activate::deny");
+    fn develop_allow_and_deny_are_ordinary_package_names() {
+        for name in ["allow", "deny"] {
+            let command = parse_command(&["develop", name]);
+            let Commands::Use(UseCommands::Develop(develop)) = command else {
+                panic!("expected the develop command");
+            };
+            assert_eq!(develop.package.as_deref(), Some(name));
+        }
     }
 }
 

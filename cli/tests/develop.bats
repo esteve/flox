@@ -166,21 +166,38 @@ EOF
 }
 
 # ---------------------------------------------------------------------------- #
-# Deprecated alias
+# Bare invocation: mirrors 'flox build's own convention of resolving the
+# project's Nix expression build(s) when none is named.
 
-@test "develop: bare 'flox develop' warns and activates" {
+@test "develop: bare invocation refuses with an error when there are no Nix expression builds" {
   project_setup
-  run "$FLOX_BIN" develop -d "$PROJECT_DIR" --print-script
-  assert_success
-  assert_output --partial "'flox develop' without a package is deprecated"
+
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR"
+  assert_failure
+  assert_output --partial "No Nix expression package found to develop"
 }
 
-@test "develop: 'flox develop -- <cmd>' warns and execs the command" {
+@test "develop: bare invocation refuses with an error naming every candidate when there is more than one Nix expression build" {
   project_setup
-  run "$FLOX_BIN" develop -d "$PROJECT_DIR" -- echo ran-the-command
+  git_init_project
+  nef_package_setup greet
+  nef_package_setup farewell
+
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR"
+  assert_failure
+  assert_output --partial "greet"
+  assert_output --partial "farewell"
+}
+
+@test "develop: bare invocation enters the shell for the project's sole Nix expression build" {
+  project_setup
+  git_init_project
+  nef_package_setup greet
+  export _FLOX_USE_CATALOG_MOCK="$UNIT_TEST_GENERATED/get_base_catalog_nixpkgs_url.yaml"
+
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR" < /dev/null
   assert_success
-  assert_output --partial "'flox develop' without a package is deprecated"
-  assert_output --partial "ran-the-command"
+  assert_output --partial "This shell approximates the build environment for 'greet'"
 }
 
 # ---------------------------------------------------------------------------- #

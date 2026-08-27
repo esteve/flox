@@ -16,7 +16,7 @@ flox-develop - enter a development shell for a Nix expression package
 flox [<general-options>] develop
      [-d=<path>]
      [--stability <stability>]
-     <package>
+     [<package>]
 ```
 
 # DESCRIPTION
@@ -123,24 +123,21 @@ on every entry:
   will start failing; re-run `flox develop <package>` to get a fresh
   shell.
 
-## Deprecated: `flox develop` without a package
+## Omitting `<package>`
 
-`flox develop` without a package argument, or followed by `--
-<command>`, is a deprecated synonym for `flox activate` and
-`flox activate -- <command>` respectively. It continues to work,
-with a deprecation warning printed to stderr.
-
-While this alias exists, a package literally named `allow` or `deny`
-cannot be entered with `flox develop`: those two words are reserved
-for `flox activate allow` / `flox activate deny`
-(auto-activation permission management), which `flox develop allow`
-and `flox develop deny` continue to reach.
+`flox develop` without a package argument resolves the project's Nix
+expression build the same way [`flox-build(1)`](./flox-build.md)
+does: with exactly one Nix expression build in `.flox/pkgs/`, that
+build is entered. With more than one, the command refuses and lists
+every candidate so you can name one. With none, it refuses and tells
+you to add one.
 
 # OPTIONS
 
 `<package>`
 :   The Nix expression package to develop. Corresponds to an
-    expression file in `.flox/pkgs/`.
+    expression file in `.flox/pkgs/`. May be omitted if the project
+    has exactly one Nix expression build.
 
 `--stability <stability>`
 :   Resolve the package's dependencies using a base package set of the

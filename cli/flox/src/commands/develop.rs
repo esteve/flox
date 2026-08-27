@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use bpaf::{Bpaf, Parser};
-use flox_config::Config;
+use bpaf::Bpaf;
 use flox_events::LifecycleFields;
 use flox_manifest::lockfile::Lockfile;
+use flox_manifest::{Manifest, MigratedTypedOnly};
 use flox_rust_sdk::flox::Flox;
 use flox_rust_sdk::models::environment::{ConcreteEnvironment, Environment};
 use flox_rust_sdk::providers::build::{
@@ -16,6 +16,7 @@ use flox_rust_sdk::providers::build::{
     ManifestBuilder,
     PackageTarget,
     PackageTargetKind,
+    PackageTargets,
     nix_expression_dir,
 };
 use flox_rust_sdk::providers::catalog_lock::BuildCatalogLock;
@@ -35,7 +36,7 @@ use super::build::{
     prefetch_expression_build_flake_ref,
     prefetch_flake_ref,
 };
-use super::{DirEnvironmentSelect, activate, dir_environment_select, needs_project_files_error};
+use super::{DirEnvironmentSelect, dir_environment_select, needs_project_files_error};
 use crate::subcommand_metric;
 use crate::utils::detect_shell::INTERACTIVE_BASH_BIN;
 use crate::utils::message;
@@ -63,85 +64,33 @@ const DISCLOSURE: &str = indoc! {"
         does neither."};
 
 #[derive(Bpaf, Clone)]
-pub enum Develop {
-    Package(#[bpaf(external(develop_options))] DevelopOptions),
-    /// Deprecated: 'flox develop' as a synonym for 'flox activate'.
-    #[bpaf(hide)]
-    DeprecatedActivate(#[bpaf(external(activate::activate))] activate::Activate),
-}
-
-#[derive(Bpaf, Clone)]
-pub struct DevelopOptions {
+pub struct Develop {
     #[bpaf(external(dir_environment_select), fallback(Default::default()))]
     environment: DirEnvironmentSelect,
 
     #[bpaf(external(base_catalog_url_select), optional)]
     base_catalog_url_select: Option<BaseCatalogUrlSelect>,
 
-    #[bpaf(external(package_argument))]
-    pub package: String,
-}
-
-/// A plain `positional(..., non_strict)` fails with bpaf's own catchable
-/// `Missing` error when absent, and that always loses to the deprecated
-/// `activate` branch's error when both branches fail on the same input:
-/// bpaf's alternation (`structs.rs::this_or_that_picks_first`) prefers
-/// whichever side failed with an uncatchable error, regardless of which
-/// side that is. `--stability`/`--nixpkgs-url` are flags this branch alone
-/// understands, so a failure to also find `<package>` should report as
-/// this branch's own message, not the deprecated branch's unrelated
-/// `-- <cmd>` suggestion (`flox develop --stability stable` reproduces
-/// this without the fix below). Routing the missing case through
-/// `.parse()` instead produces an uncatchable error unconditionally, which
-/// wins that comparison. A bare `flox develop` is unaffected: it still
-/// reaches the deprecated branch, because that branch parses the empty
-/// remainder successfully, and alternation always prefers a success over
-/// an error on the other side regardless of error kind.
-fn package_argument() -> impl Parser<String> {
-    bpaf::positional("package")
-        .help("The Nix expression package to develop.\nCorresponds to an expression file in '.flox/pkgs/'.")
-        .non_strict()
-        .optional()
-        .parse(|package: Option<String>| {
-            package.ok_or_else(|| {
-                "expected <PACKAGE>: the name of a Nix expression under '.flox/pkgs/'".to_string()
-            })
-        })
+    /// The Nix expression package to develop.
+    /// Corresponds to an expression file in '.flox/pkgs/'.
+    /// If omitted, the project's sole Nix expression build is used;
+    /// with more than one, name which to develop.
+    #[bpaf(positional("package"))]
+    pub package: Option<String>,
 }
 
 impl Develop {
-    /// Centrally-derived subcommand string for this invocation. The package
-    /// form returns its own name; the deprecated form delegates to
-    /// [`activate::Activate::subcommand_name`] so the legacy `activate`,
-    /// `activate::allow` and `activate::deny` wire names survive unchanged —
-    /// there is no `flox develop deprecated` behind a `develop::deprecated`
-    /// key for a dashboard to find.
     pub fn subcommand_name(&self) -> &'static str {
-        match self {
-            Develop::Package(_) => "develop",
-            Develop::DeprecatedActivate(activate) => activate.subcommand_name(),
-        }
+        "develop"
     }
 
-    pub async fn handle(self, config: Config, flox: Flox) -> Result<()> {
-        match self {
-            Develop::Package(opts) => {
-                subcommand_metric!("develop", "deprecated_alias" = false);
-                Self::develop(flox, opts).await
-            },
-            Develop::DeprecatedActivate(activate) => {
-                subcommand_metric!("develop", "deprecated_alias" = true);
-                message::warning(formatdoc! {"
-                    'flox develop' without a package is deprecated; it currently behaves as 'flox activate'.
-                    Use 'flox develop <PACKAGE>' to enter a development shell for a Nix expression build.
-                "});
-                activate.handle(config, flox).await
-            },
-        }
+    pub async fn handle(self, flox: Flox) -> Result<()> {
+        subcommand_metric!("develop");
+        Self::develop(flox, self).await
     }
 
-    async fn develop(mut flox: Flox, opts: DevelopOptions) -> Result<()> {
-        let DevelopOptions {
+    async fn develop(mut flox: Flox, opts: Develop) -> Result<()> {
+        let Develop {
             environment,
             base_catalog_url_select,
             package,
@@ -157,11 +106,7 @@ impl Develop {
 
         let expression_parent_dir = env.dot_flox_path();
         let expression_path_ref = NixFlakeref::from_path(&expression_parent_dir)?;
-        let targets = packages_to_build(&lockfile_manifest, &expression_path_ref, &[package])?;
-        let target = targets
-            .into_iter()
-            .next()
-            .context("packages_to_build returned no targets for the requested package")?;
+        let target = Self::resolve_target(&lockfile_manifest, &expression_path_ref, package)?;
 
         // An unsandboxed manifest build already refuses `--stability`
         // (`disallow_base_url_select_for_manifest_builds`, build.rs), but
@@ -277,6 +222,62 @@ impl Develop {
 
         // exec should never return
         Err(command.exec()).context("failed to exec development shell")
+    }
+
+    /// Resolve the package to develop from the optional CLI argument.
+    ///
+    /// A named package is validated against the environment's known
+    /// targets exactly as `flox build <package>` validates its own.
+    /// With no argument, this mirrors `flox build`'s bare-invocation
+    /// convention for a single-build project: the sole Nix expression
+    /// build is used if there is exactly one. Manifest builds are never
+    /// candidates for that fallback — `refuse_manifest_build` below
+    /// refuses one unconditionally, so silently falling into one here
+    /// would only relocate that refusal to a worse error.
+    fn resolve_target(
+        manifest: &Manifest<MigratedTypedOnly>,
+        expression_ref: &NixFlakeref,
+        package: Option<String>,
+    ) -> Result<PackageTarget> {
+        if let Some(package) = package {
+            let targets = packages_to_build(manifest, expression_ref, &[package])?;
+            return targets
+                .into_iter()
+                .next()
+                .context("packages_to_build returned no targets for the requested package");
+        }
+
+        let mut expression_targets: Vec<PackageTarget> =
+            PackageTargets::new(manifest, expression_ref)?
+                .all()
+                .into_iter()
+                .filter(|target| target.kind().is_expression_build())
+                .collect();
+
+        match expression_targets.len() {
+            0 => bail!(formatdoc! {"
+                No Nix expression package found to develop.
+
+                Add one by creating a file under '{expression_ref}'.
+                ", expression_ref = expression_ref.as_url()
+            }),
+            1 => Ok(expression_targets.remove(0)),
+            _ => {
+                expression_targets.sort_by_key(|target| target.name().to_string());
+                let candidates = expression_targets
+                    .iter()
+                    .map(PackageTarget::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(formatdoc! {"
+                    Multiple Nix expression packages found: {candidates}.
+
+                    Name the one to develop:
+                      $ flox develop <package>
+                    "
+                })
+            },
+        }
     }
 
     /// A pushed or pulled (FloxHub-linked) environment cannot be assumed to
@@ -504,6 +505,11 @@ pub(crate) enum DevelopError {
 mod tests {
     use flox_rust_sdk::flox::test_helpers::{flox_instance, flox_instance_with_optional_floxhub};
     use flox_rust_sdk::models::environment::managed_environment::test_helpers::mock_managed_environment_in;
+    use flox_rust_sdk::models::environment::path_environment::test_helpers::new_path_environment;
+    use flox_rust_sdk::providers::build::test_helpers::{
+        prepare_empty_expressions_ref,
+        prepare_nix_expressions_in,
+    };
     use flox_rust_sdk::providers::build::{ExpressionBuildMetadata, PackageTargetKind};
 
     use super::*;
@@ -568,5 +574,110 @@ mod tests {
             err,
             DevelopError::DerivationGarbageCollected { pname } if pname == "greet"
         ));
+    }
+
+    /// With no package argument and exactly one Nix expression build in
+    /// the project, that build is the one resolved -- mirroring `flox
+    /// build`'s own bare-invocation behavior for a single-build project.
+    #[test]
+    fn resolve_target_selects_sole_expression_build() {
+        let (flox, tempdir) = flox_instance();
+        let mut env = new_path_environment(&flox, "version = 1\n");
+        let expression_ref = prepare_nix_expressions_in(&tempdir, &[(&["greet"], indoc! {r#"
+            {runCommand}: runCommand "greet" {} ""
+        "#})]);
+        let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
+        let lockfile_manifest = lockfile.migrated_manifest().unwrap();
+
+        let target = Develop::resolve_target(&lockfile_manifest, &expression_ref, None).unwrap();
+        assert_eq!(target.name().to_string(), "greet");
+    }
+
+    /// With more than one Nix expression build and no package argument,
+    /// resolution is refused with an error naming every candidate rather
+    /// than picking one arbitrarily.
+    #[test]
+    fn resolve_target_names_candidates_when_multiple_expression_builds_exist() {
+        let (flox, tempdir) = flox_instance();
+        let mut env = new_path_environment(&flox, "version = 1\n");
+        let expression_ref = prepare_nix_expressions_in(&tempdir, &[
+            (&["greet"], indoc! {r#"
+                {runCommand}: runCommand "greet" {} ""
+            "#}),
+            (&["farewell"], indoc! {r#"
+                {runCommand}: runCommand "farewell" {} ""
+            "#}),
+        ]);
+        let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
+        let lockfile_manifest = lockfile.migrated_manifest().unwrap();
+
+        let message = Develop::resolve_target(&lockfile_manifest, &expression_ref, None)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("greet"));
+        assert!(message.contains("farewell"));
+    }
+
+    /// With no Nix expression builds at all, a bare `flox develop` is
+    /// refused rather than silently falling back to the alias's old
+    /// `flox activate` behavior, which no longer exists.
+    #[test]
+    fn resolve_target_errors_when_no_expression_builds_exist() {
+        let (flox, _tempdir) = flox_instance();
+        let mut env = new_path_environment(&flox, "version = 1\n");
+        let expression_ref = prepare_empty_expressions_ref();
+        let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
+        let lockfile_manifest = lockfile.migrated_manifest().unwrap();
+
+        let result = Develop::resolve_target(&lockfile_manifest, expression_ref, None);
+        assert!(result.is_err());
+    }
+
+    /// A manifest build is not a candidate for the bare-invocation
+    /// fallback: entering its shell unconditionally is the job
+    /// `refuse_manifest_build` already refuses, so a project with only a
+    /// manifest build must fail the same way a project with none does.
+    #[test]
+    fn resolve_target_ignores_manifest_builds_for_bare_invocation() {
+        let (flox, _tempdir) = flox_instance();
+        let manifest = formatdoc! {r#"
+            version = 1
+
+            [build.greet]
+            command = ""
+        "#};
+        let mut env = new_path_environment(&flox, &manifest);
+        let expression_ref = prepare_empty_expressions_ref();
+        let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
+        let lockfile_manifest = lockfile.migrated_manifest().unwrap();
+
+        let result = Develop::resolve_target(&lockfile_manifest, expression_ref, None);
+        assert!(result.is_err());
+    }
+
+    /// A named package is still validated against the environment's known
+    /// targets, independent of how many Nix expression builds exist.
+    #[test]
+    fn resolve_target_selects_named_package_among_several() {
+        let (flox, tempdir) = flox_instance();
+        let mut env = new_path_environment(&flox, "version = 1\n");
+        let expression_ref = prepare_nix_expressions_in(&tempdir, &[
+            (&["greet"], indoc! {r#"
+                {runCommand}: runCommand "greet" {} ""
+            "#}),
+            (&["farewell"], indoc! {r#"
+                {runCommand}: runCommand "farewell" {} ""
+            "#}),
+        ]);
+        let lockfile: Lockfile = env.lockfile(&flox).unwrap().into();
+        let lockfile_manifest = lockfile.migrated_manifest().unwrap();
+
+        let target = Develop::resolve_target(
+            &lockfile_manifest,
+            &expression_ref,
+            Some("farewell".to_string()),
+        )
+        .unwrap();
+        assert_eq!(target.name().to_string(), "farewell");
     }
 }
