@@ -1,6 +1,6 @@
 use std::env;
 use std::os::unix::process::ExitStatusExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -27,6 +27,11 @@ use flox_rust_sdk::providers::build::{
     nix_expression_dir,
 };
 use flox_rust_sdk::providers::catalog::base_catalog_url_for_stability_arg;
+use flox_rust_sdk::providers::catalog_lock::{
+    BuildCatalogLock,
+    catalog_lockfile_path,
+    lock_project_catalog,
+};
 use flox_rust_sdk::providers::git::{GitCommandProvider, GitProvider};
 use flox_rust_sdk::providers::nix;
 use flox_rust_sdk::utils::{CommandExt, FLOX_INTERPRETER};
@@ -42,6 +47,14 @@ use super::{DirEnvironmentSelect, dir_environment_select, needs_project_files_er
 use crate::utils::events::duration_to_ms;
 use crate::utils::message;
 use crate::{environment_subcommand_metric, subcommand_metric};
+
+/// How the user invokes the catalog-lock update, for messages that name it.
+///
+/// NAMING: provisional — the command is expected to be renamed (or folded
+/// into a flag such as `flox build --lock-catalog`) once the UX discussion
+/// settles. Keep the user-visible name confined to this constant and the
+/// `UpdateCatalogs` bpaf declaration so the rename stays a two-line change.
+pub(crate) const UPDATE_CATALOGS_COMMAND: &str = "flox build update-catalogs";
 
 #[derive(Debug, Clone, Bpaf)]
 pub enum BaseCatalogUrlSelect {
@@ -120,8 +133,16 @@ enum SubcommandOrBuildTargets {
     },
     /// Update catalog lockfile
     ///
-    /// Resolves catalog inputs and writes the lockfile.
-    #[bpaf(command, hide)]
+    /// Scans the project's Nix expression builds for catalog references and
+    /// locks them to '.flox/catalog.lock', the single set of pinned catalog
+    /// inputs every build of the project evaluates against.
+    //
+    // NAMING: provisional; see the note at [UPDATE_CATALOGS_COMMAND] before
+    // renaming.
+    #[bpaf(
+        command,
+        footer("Run 'man flox-build-update-catalogs' for more details.")
+    )]
     UpdateCatalogs {},
     BuildTargets {
         #[bpaf(external(base_catalog_url_select), optional)]
@@ -149,7 +170,7 @@ impl Build {
         match &self.subcommand_or_targets {
             SubcommandOrBuildTargets::Clean { .. } => "build::clean",
             SubcommandOrBuildTargets::ImportNixpkgs { .. } => "build::import-nixpkgs",
-            SubcommandOrBuildTargets::UpdateCatalogs {} => "build::update-catalogs",
+            SubcommandOrBuildTargets::UpdateCatalogs { .. } => "build::update-catalogs",
             SubcommandOrBuildTargets::BuildTargets { .. } => "build",
         }
     }
@@ -277,7 +298,7 @@ impl Build {
         prefetch_flake_ref(&COMMON_NIXPKGS_URL)?;
 
         let lockfile_manifest = lockfile.migrated_manifest()?;
-        let (packages_to_build, expression_ref) = {
+        let (packages_to_build, expression_ref, expression_path_ref) = {
             // TODO: decouple from env
             let expression_parent_dir = env.dot_flox_path();
             let expression_path_ref = NixFlakeref::from_path(&expression_parent_dir)?;
@@ -289,7 +310,10 @@ impl Build {
             )?;
             (
                 packages_to_build,
-                expression_git_ref.unwrap_or(expression_path_ref),
+                expression_git_ref
+                    .clone()
+                    .unwrap_or(expression_path_ref.clone()),
+                expression_path_ref,
             )
         };
 
@@ -297,13 +321,6 @@ impl Build {
             &packages_to_build,
             nixpkgs_url_select.is_some(),
         )?;
-
-        // The `--stability` selection also determines the stability used to
-        // resolve the catalog build inputs of NEF (expression) builds.
-        let nef_stability = match &nixpkgs_url_select {
-            Some(BaseCatalogUrlSelect::Stability(stability)) => Some(stability.clone()),
-            _ => None,
-        };
 
         let base_nixpkgs_url =
             base_nixpkgs_url_from_url_select(&flox, nixpkgs_url_select, Some(&lockfile))
@@ -329,6 +346,54 @@ impl Build {
             "has_manifest_build" = has_manifest_build
         );
 
+        // The catalog lock the NEF evals consume, created by the CLI: the
+        // committed .flox/catalog.lock exactly as found, or a fresh
+        // ephemeral lock living only for this invocation. Scanning is
+        // scoped to the expressions being built — the scanner follows
+        // imports, so their references are exactly what the evals look up —
+        // except when a manifest build is among the targets, whose `${pkg}`
+        // references can pull in any of the project's expressions, so all
+        // of them are covered. A project without expression builds needs no
+        // lock at all.
+        let lock_rel_paths: Vec<PathBuf> = if has_manifest_build {
+            // Enumerated only on this branch: the discovery `nix eval`
+            // behind `packages_to_build` is not free, and the expression-only
+            // case never needs the full inventory. (`self::` disambiguates
+            // the function from the shadowing local above.)
+            self::packages_to_build(&lockfile_manifest, &expression_path_ref, &[] as &[&str])?
+                .iter()
+                .filter_map(|target| match target.kind() {
+                    PackageTargetKind::ExpressionBuild(expression) => {
+                        Some(expression.rel_file_path.clone())
+                    },
+                    PackageTargetKind::ManifestBuild { .. } => None,
+                })
+                .collect()
+        } else {
+            packages_to_build
+                .iter()
+                .filter_map(|target| match target.kind() {
+                    PackageTargetKind::ExpressionBuild(expression) => {
+                        Some(expression.rel_file_path.clone())
+                    },
+                    PackageTargetKind::ManifestBuild { .. } => None,
+                })
+                .collect()
+        };
+        let catalog_lock = match lock_rel_paths.is_empty() {
+            true => None,
+            false => Some(
+                BuildCatalogLock::ensure(
+                    &flox.floxhub_client,
+                    env.dot_flox_path(),
+                    nix_expression_dir(&env),
+                    &lock_rel_paths,
+                    &flox.temp_dir,
+                )
+                .await?,
+            ),
+        };
+
         let cache_path = env.cache_path()?;
         let builder = FloxBuildMk::new(
             &flox,
@@ -342,7 +407,7 @@ impl Build {
             &base_nixpkgs_url,
             &FLOX_INTERPRETER,
             &target_names,
-            nef_stability,
+            catalog_lock.as_ref().map(|lock| lock.path()),
             None,
             system_override,
         );
@@ -539,19 +604,62 @@ impl Build {
         Ok(())
     }
 
-    async fn update_catalogs(_flox: &Flox, _env: ConcreteEnvironment) -> Result<()> {
-        // The standalone `nix-builds.toml` catalog-declaration + nix-prefetch
-        // locking path has been retired (ECO-93/D4). Catalog inputs are now
-        // resolved and locked through the lockless lookup flow as part of the
-        // build itself, so there is no separate lockfile to update here.
-        // Full removal of this subcommand follows in ECO-94/95.
-        bail!(formatdoc! {"
-            `flox build update-catalogs` is no longer supported.
+    #[instrument(name = "build::update-catalogs", skip_all)]
+    async fn update_catalogs(flox: &Flox, mut env: ConcreteEnvironment) -> Result<()> {
+        match &env {
+            ConcreteEnvironment::Path(_) => (),
+            ConcreteEnvironment::Managed(managed) => {
+                bail!(needs_project_files_error(managed, "update catalogs"))
+            },
+            ConcreteEnvironment::Remote(_) => {
+                // guarded by DirEnvironmentSelect
+                unreachable!("Cannot update catalogs of a remote environment")
+            },
+        };
 
-            Catalog inputs are now locked automatically during the build via the
-            lockless resolution flow; the standalone nix-builds.toml locking step
-            has been retired.
-        "});
+        let expression_ref = NixFlakeref::from_path(env.dot_flox_path())?;
+        let lockfile: Lockfile = env.lockfile(flox)?.into();
+        let manifest = lockfile.migrated_manifest()?;
+
+        let rel_file_paths: Vec<_> = packages_to_build(&manifest, &expression_ref, &[]
+            as &[&str])?
+        .into_iter()
+        .filter_map(|target| match target.kind() {
+            PackageTargetKind::ExpressionBuild(expression) => {
+                Some(expression.rel_file_path.clone())
+            },
+            PackageTargetKind::ManifestBuild { .. } => None,
+        })
+        .collect();
+
+        if rel_file_paths.is_empty() {
+            message::plain(
+                "No Nix expression builds found; only expression builds reference the catalog.",
+            );
+            return Ok(());
+        }
+
+        let lockfile_path = catalog_lockfile_path(env.dot_flox_path());
+        let references = lock_project_catalog(
+            &flox.floxhub_client,
+            nix_expression_dir(&env),
+            &rel_file_paths,
+            &lockfile_path,
+        )
+        .await?;
+
+        if references.is_empty() {
+            message::created(formatdoc! {"
+                No catalog references found; wrote an empty '.flox/catalog.lock'.
+                Commit the file so every revision builds against the same inputs."});
+        } else {
+            message::created(formatdoc! {"
+                Locked {count} catalog reference(s) to '.flox/catalog.lock'.
+                Commit the file so every revision builds against the same inputs.",
+                count = references.len(),
+            });
+        }
+        Ok(())
     }
 
     /// If so, shorten symlink for a package it if in the current directory.

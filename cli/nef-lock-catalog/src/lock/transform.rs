@@ -35,7 +35,7 @@ pub(crate) fn build_lock_from_locked_inputs<'d>(
             })?;
             Ok((key.clone(), entry))
         })
-        .collect::<Result<HashMap<String, LockedInputEntry>>>()?;
+        .collect::<Result<BTreeMap<String, LockedInputEntry>>>()?;
 
     for entry in locked.into_values() {
         let LockedInputEntry {

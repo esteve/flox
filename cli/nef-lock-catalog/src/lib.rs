@@ -23,7 +23,15 @@ impl Display for CatalogId {
     }
 }
 
-pub use lock::build_lock::{BuildLock, render_lock, write_lock};
+pub use lock::build_lock::{
+    BuildLock,
+    LockfileError,
+    StaleLockError,
+    read_lock,
+    render_lock,
+    subset_direct_inputs,
+    write_lock,
+};
 pub use lock::flakeref::NixFlakeref;
 pub use lock::lookup::{LockError, lock_references};
 pub use lock::render::render_unresolvable;
