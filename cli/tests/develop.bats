@@ -342,3 +342,26 @@ develop_env_script_path() {
     | xargs -0 grep -l "^nix_saved_PATH=" 2>/dev/null \
     | head -1
 }
+
+# ---------------------------------------------------------------------------- #
+
+# bats test_tags=develop:command
+@test "develop: -c runs a command in the dev shell non-interactively and propagates its exit status" {
+  project_setup
+  git_init_project
+  nef_package_setup greet
+  export _FLOX_USE_CATALOG_MOCK="$UNIT_TEST_GENERATED/get_base_catalog_nixpkgs_url.yaml"
+
+  # The command sees the dev environment (stdenv's $buildPhase machinery is
+  # loaded and $src points into the store), stdout carries only the
+  # command's own output, and no disclosure or prompt noise appears.
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR" -c 'echo "src=$src"; type genericBuild >/dev/null && echo have-genericBuild'
+  assert_success
+  assert_line --partial "src=/nix/store/"
+  assert_line "have-genericBuild"
+  refute_output --partial "This shell approximates the build environment"
+
+  # The command's exit status becomes flox develop's.
+  run "$FLOX_BIN" develop -d "$PROJECT_DIR" -c 'exit 7'
+  assert_equal "$status" 7
+}

@@ -35,7 +35,12 @@ use super::build::{
     prefetch_expression_build_flake_ref,
     prefetch_flake_ref,
 };
-use super::{DirEnvironmentSelect, dir_environment_select, needs_project_files_error};
+use super::{
+    DirEnvironmentSelect,
+    SHELL_COMPLETION_COMMAND,
+    dir_environment_select,
+    needs_project_files_error,
+};
 use crate::subcommand_metric;
 use crate::utils::detect_shell::INTERACTIVE_BASH_BIN;
 use crate::utils::message;
@@ -70,6 +75,15 @@ pub struct Develop {
     #[bpaf(external(base_catalog_url_select), optional)]
     base_catalog_url_select: Option<BaseCatalogUrlSelect>,
 
+    /// Shell command string to run in the development shell instead of entering it interactively
+    #[bpaf(
+        long("command"),
+        short('c'),
+        argument("cmd"),
+        complete_shell(SHELL_COMPLETION_COMMAND)
+    )]
+    shell_command: Option<String>,
+
     /// The Nix expression package to develop.
     /// Corresponds to an expression file in '.flox/pkgs/'.
     /// If omitted, the project's sole Nix expression build is used;
@@ -92,6 +106,7 @@ impl Develop {
         let Develop {
             environment,
             base_catalog_url_select,
+            shell_command,
             package,
         } = opts;
 
@@ -174,9 +189,6 @@ impl Develop {
             .clone();
 
         let env_script_path = Self::print_dev_env(&flox, &drv_path, target.name().as_ref())?;
-        let rcfile_path = Self::render_rcfile(&flox)?;
-
-        Self::print_disclosure(target.name().as_ref());
 
         // `exec` replaces this process, so the dispatcher's end-of-run
         // `command_completed` emit (main.rs) never runs; record it here
@@ -193,6 +205,32 @@ impl Develop {
         if let Err(err) = hub.flush(flox_events::force_flush_requested()) {
             debug!(error = %err, "Failed to flush v2 events before exec");
         }
+
+        // Mirrors 'flox activate -c': the command string runs in a
+        // non-interactive subshell — no ~/.bashrc, no prompt, no
+        // disclosure — with the development environment sourced first, and
+        // the command's exit status becomes this process's. The string
+        // reaches the wrapper as an environment variable and is run with
+        // `eval`, so its text is never interpolated into shell source (the
+        // same injection-safety rule the rcfile follows).
+        if let Some(shell_command) = shell_command {
+            let mut command = Command::new(&*INTERACTIVE_BASH_BIN);
+            command.env("_FLOX_DEVELOP_ENV_SCRIPT", &env_script_path);
+            command.env("_FLOX_DEVELOP_COMMAND", &shell_command);
+            command
+                .arg("--noprofile")
+                .arg("--norc")
+                .arg("-c")
+                .arg(r#"source "$_FLOX_DEVELOP_ENV_SCRIPT" && eval "$_FLOX_DEVELOP_COMMAND""#);
+            debug!(command = ?command, "exec'ing development shell command");
+
+            // exec should never return
+            return Err(command.exec()).context("failed to exec development shell command");
+        }
+
+        let rcfile_path = Self::render_rcfile(&flox)?;
+
+        Self::print_disclosure(target.name().as_ref());
 
         let mut command = Command::new(&*INTERACTIVE_BASH_BIN);
         // `pname` and the `print-dev-env` script path are passed as

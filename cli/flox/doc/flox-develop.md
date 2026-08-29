@@ -16,6 +16,7 @@ flox-develop - enter a development shell for a Nix expression package
 flox [<general-options>] develop
      [-d=<path>]
      [--stability <stability>]
+     [-c=<cmd>]
      [<package>]
 ```
 
@@ -154,6 +155,16 @@ kind, it refuses with the same "no packages found" guidance
     `--stability` flag of [`flox-build(1)`](./flox-build.md): the
     shell must use the same nixpkgs the build would, or the two stop
     agreeing on what a failure means.
+
+`-c`, `--command <cmd>`
+:   Run a shell command string in the development shell instead of
+    entering it interactively, mirroring the `-c` flag of
+    [`flox-activate(1)`](./flox-activate.md).
+    The command runs in a non-interactive subshell with the
+    development environment sourced first: `~/.bashrc` is not read
+    and the entry disclosure is not printed.
+    The command's exit status becomes the exit status of
+    `flox develop`.
 
 ```{.include}
 ./include/dir-environment-options.md
