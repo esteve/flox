@@ -114,25 +114,34 @@ pub fn fish_hook(flox_bin: &str) -> String {
     formatdoc!(
         r#"
         set -gx {PROMPT_HOOK_VERSION_ENV} {marker};
-        function _flox_hook --on-event fish_prompt;
+        function _flox_hook_eval;
             eval ("{flox_bin}" hook-env --shell fish --shell-pid $fish_pid --invocation-types "${FLOX_INVOCATION_TYPES_VAR}" | string collect);
+        end;
+        function _flox_hook --on-event fish_prompt;
+            if not set -q _flox_hook_initialized;
+                set -g _flox_hook_initialized 1;
+                _flox_hook_eval;
+            end;
             if test "$FLOX_AUTO_ACTIVATE_FISH_MODE" != "disable_arrow";
                 set -g _flox_pwd_hook_active 1;
             end;
+        end;
+        function _flox_hook_postexec --on-event fish_postexec;
+            _flox_hook_eval;
         end;
         function _flox_hook_pwd --on-variable PWD;
             if set -q _flox_pwd_hook_active;
                 if test "$FLOX_AUTO_ACTIVATE_FISH_MODE" = "eval_after_arrow";
                     set -g _flox_env_again 0;
                 else;
-                    eval ("{flox_bin}" hook-env --shell fish --shell-pid $fish_pid --invocation-types "${FLOX_INVOCATION_TYPES_VAR}" | string collect);
+                    _flox_hook_eval;
                 end;
             end;
         end;
         function _flox_hook_preexec --on-event fish_preexec;
             if set -q _flox_env_again;
                 set -e _flox_env_again;
-                eval ("{flox_bin}" hook-env --shell fish --shell-pid $fish_pid --invocation-types "${FLOX_INVOCATION_TYPES_VAR}" | string collect);
+                _flox_hook_eval;
             end;
             set -e _flox_pwd_hook_active;
         end;
